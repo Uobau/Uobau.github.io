@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HMLV – POLCA / CONWIP (GitHub Pages)</title>
+  <title>HMLV – POLCA / CONWIP (Toczenie • Frezowanie • Cięcie • Kontrola)</title>
   <style>
     :root{
       --bg:#121216; --ink:#EBEBF0; --mid:#5C606E; --grey:#7D808C;
@@ -97,13 +97,13 @@
   </div>
 
 <script>
-// ================================
-// HMLV – POLCA / CONWIP (Canvas)
-// ================================
-// 5-station layout: Start, Toczenie, Frezowanie, Kontrola, Sink
-// Modes:
-//  • CONWIP – globalna pula kart (zwrot do Start po Sink)
-//  • POLCA – karty dla każdej pary (w tym Start→Pierwsze)
+// ==============================================
+// HMLV – POLCA / CONWIP (T/F/C/K + Start / Sink)
+// ==============================================
+// Stanowiska: Toczenie, Frezowanie, Cięcie, Kontrola
+// Marszruty: startują z {Toczenie, Frezowanie, Cięcie},
+//            długość ~ 4 operacje (Poisson λ≈3 + opcjonalna Kontrola na końcu)
+// Tryby: CONWIP (globalne karty) / POLCA (karty par gniazd)
 
 // ---------- Stałe UI/świata ----------
 const WORLD_W=1440, WORLD_H=900;
@@ -111,70 +111,84 @@ const NODE_R=46, PROGRESS_MARGIN_Y=14, FOOTER_H=164;
 const COLOR={ bg:'#121216', ink:'#EBEBF0', mid:'#5C606E', grey:'#7D808C', green:'#50C878', amber:'#F0C850', red:'#DC5A5A', purple:'#B478F0', cyan:'#50D2D2', start:'#FF40A0' };
 const PALETTE=['#56B4E9','#E69F00','#009E73','#F0E442','#0072B2','#D55E00','#CC79A7'];
 const QUEUE_DOT_R=7, QUEUE_GAP=8, QUEUE_BAR_H_BASE=28, QUEUE_COLS_EXP=6, QUEUE_COLLAPSED_SHOW=5, SLOT_PADDING_X=12, SLOT_PADDING_Y=6, ROW_H=QUEUE_DOT_R*2+6;
-let SIM_SPEED=0.6, MOVE_TIME=1.4, SIM_DT_STEP=2.0; let N_JOBS=36, SEED=42, ARRIVAL_MEAN=10.0; let CONWIP_LIMIT=8; let MODE='CONWIP';
+let SIM_SPEED=0.6, MOVE_TIME=1.4, SIM_DT_STEP=2.0; let N_JOBS=40, SEED=123, ARRIVAL_MEAN=9.0; let CONWIP_LIMIT=8; let MODE='CONWIP';
 
-// Layout (5 gniazd)
-const CELLS=["Start","Toczenie","Frezowanie","Kontrola","Sink"];
-let NODE_POS={ Start:[120,450], Toczenie:[520,300], Frezowanie:[860,300], Kontrola:[690,610], Sink:[1280,450] };
+// Layout (Start, 4 gniazda, Sink)
+const OPS=['Toczenie','Frezowanie','Cięcie','Kontrola'];
+const CELLS=['Start',...OPS,'Sink'];
+let NODE_POS={ Start:[120,450], Toczenie:[480,270], Frezowanie:[860,260], Cięcie:[480,630], Kontrola:[860,630], Sink:[1280,450] };
 
-// Marszruty (z powrotami)
-const ROUTES_CORE=[ ["Toczenie","Frezowanie","Toczenie","Kontrola"], ["Toczenie","Frezowanie","Kontrola"], ["Frezowanie","Kontrola"], ["Toczenie","Kontrola"], ["Frezowanie","Toczenie","Kontrola"] ];
-
-// Kolory krawędzi dla par
-const EDGE_OPS=(()=>{ const s=new Set(); for(const r of ROUTES_CORE){for(let i=0;i<r.length-1;i++) s.add(r[i]+"→"+r[i+1]);} return Array.from(s).sort(); })();
-const PAIR_COLORS=(()=>{ const map=new Map(); let it=0; for(const p of EDGE_OPS){ map.set(p, PALETTE[it++%PALETTE.length]); } map.set('Start→Toczenie', COLOR.start); map.set('Start→Frezowanie', COLOR.start); map.set('Start→Kontrola', COLOR.start); return map; })();
-function colorForPair(a,b){ return PAIR_COLORS.get(`${a}→${b}`) || '#B4B4BE'; }
-
-// RNG
+// ----- losowanie marszrut -----
 function mulberry32(a){return function(){let t=a+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296;}}
-let rnd = mulberry32(SEED); function rand(){return rnd();} function randExp(mean){return -Math.log(1-rand())*mean;} function randNormal(){const u=1-rand(), v=1-rand(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);} function randLogNormal(mu, sigma){return Math.exp(mu + sigma*randNormal());}
-function procTime(cell){ let mu, s; switch(cell){ case 'Toczenie': mu=Math.log(40); s=.6; break; case 'Frezowanie': mu=Math.log(35); s=.7; break; case 'Kontrola': mu=Math.log(20); s=.5; break; default: mu=Math.log(30); s=.6; } return randLogNormal(mu, s); }
+let rnd=mulberry32(SEED); function rand(){return rnd();}
+function randExp(mean){return -Math.log(1-rand())*mean;}
+function randNormal(){const u=1-rand(), v=1-rand(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);} 
+function randPoisson(lambda){ // Knuth
+  const L=Math.exp(-lambda); let k=0, p=1; do {k++; p*=rand();} while(p>L); return k-1; }
+function randLogNormal(mu, sigma){return Math.exp(mu + sigma*randNormal());}
 
-// ----- Wspólne narzędzia -----
+function randomRoute(){
+  const startOps=['Toczenie','Frezowanie','Cięcie'];
+  const lenBase=Math.max(2, Math.min(6, randPoisson(3))); // ~3
+  const route=[ startOps[Math.floor(rand()*startOps.length)] ];
+  while(route.length < lenBase){ route.push( OPS[Math.floor(rand()*OPS.length)] ); }
+  if(route[route.length-1]!== 'Kontrola' && rand()<0.6) route.push('Kontrola'); // często kontrola na końcu
+  return route;
+}
+
+function procTime(cell){
+  // lognormal, różne parametry
+  let mu, s; 
+  switch(cell){
+    case 'Toczenie':   mu=Math.log(38); s=.55; break;
+    case 'Frezowanie': mu=Math.log(33); s=.65; break;
+    case 'Cięcie':     mu=Math.log(18); s=.45; break;
+    case 'Kontrola':   mu=Math.log(16); s=.40; break;
+    default:           mu=Math.log(25); s=.60;
+  }
+  return randLogNormal(mu, s); // minuty
+}
+
+// Krawędzie do rysowania: wszystkie pary między OPS + Start→{T,F,C}
+const EDGE_OPS=(()=>{ const s=new Set(); for(const a of OPS){ for(const b of OPS){ if(a!==b) s.add(`${a}→${b}`);} } for(const a of ['Toczenie','Frezowanie','Cięcie']) s.add(`Start→${a}`); return Array.from(s).sort(); })();
+const PAIR_COLORS=(()=>{ const map=new Map(); let it=0; for(const p of EDGE_OPS){ map.set(p, PALETTE[it++%PALETTE.length]); } return map; })();
+function colorForPair(a,b){ if(a==='Start') return COLOR.start; return PAIR_COLORS.get(`${a}→${b}`)||'#B4B4BE'; }
+
+// ----- Narzędzia wspólne -----
 class Event{constructor(time,type,payload){this.time=time;this.type=type;this.payload=payload;}}
 class MinHeap{constructor(){this.a=[]} push(e){this.a.push(e);this._up(this.a.length-1)} _up(i){while(i>0){const p=(i-1>>1); if(this.a[p].time<=this.a[i].time) break; [this.a[p],this.a[i]]=[this.a[i],this.a[p]]; i=p} } pop(){if(this.a.length===0) return null; const r=this.a[0]; const x=this.a.pop(); if(this.a.length){this.a[0]=x; this._dn(0);} return r} _dn(i){for(;;){let l=i*2+1, r=i*2+2, m=i; if(l<this.a.length && this.a[l].time<this.a[m].time) m=l; if(r<this.a.length && this.a[r].time<this.a[m].time) m=r; if(m===i) break; [this.a[m],this.a[i]]=[this.a[i],this.a[m]]; i=m}} peek(){return this.a.length?this.a[0]:null} get length(){return this.a.length}}
 class Job{constructor(jid,route,times){this.jid=jid;this.route=route;this.times=times}}
 
 // ----- CONWIP -----
 class ConwipSim{
-  constructor(n=N_JOBS){ this.mode='CONWIP'; this.time=0; this.WIP=0; this.log=[]; this.jobs={}; this.cell_busy_until={}; this.cell_current={}; this.cell_queues={}; this.events=new MinHeap(); this.backlog=[]; this.cards_total=CONWIP_LIMIT; this.cards_avail=CONWIP_LIMIT; for(let i=1;i<=n;i++){ const r=ROUTES_CORE[Math.floor(rand()*ROUTES_CORE.length)]; const times=r.map(c=>procTime(c)); const jid=`Z${String(i).padStart(2,'0')}`; this.jobs[jid]=new Job(jid, r.slice(), times);} const ops=CELLS.filter(c=>c!=='Start'&&c!=='Sink'); for(const c of ops){this.cell_busy_until[c]=0; this.cell_current[c]=null; this.cell_queues[c]=[]} let t=0; for(const jid of Object.keys(this.jobs)){ t+=randExp(ARRIVAL_MEAN); this.events.push(new Event(t,'arrival',[jid])); } }
+  constructor(n=N_JOBS){ this.mode='CONWIP'; this.time=0; this.WIP=0; this.log=[]; this.jobs={}; this.cell_busy_until={}; this.cell_current={}; this.cell_queues={}; this.events=new MinHeap(); this.backlog=[]; this.cards_total=CONWIP_LIMIT; this.cards_avail=CONWIP_LIMIT; for(let i=1;i<=n;i++){ const r=randomRoute(); const times=r.map(c=>procTime(c)); const jid=`Z${String(i).padStart(2,'0')}`; this.jobs[jid]=new Job(jid, r.slice(), times);} const ops=OPS; for(const c of ops){this.cell_busy_until[c]=0; this.cell_current[c]=null; this.cell_queues[c]=[]} let t=0; for(const jid of Object.keys(this.jobs)){ t+=randExp(ARRIVAL_MEAN); this.events.push(new Event(t,'arrival',[jid])); } }
   _emit(rec){ this.log.push(rec); }
   _log(ev,{jid=null,cell=null,idx=null,details=null}={}){ const route = jid? this.jobs[jid].route.join(' → '): null; const op = (jid!=null && idx!=null && idx < this.jobs[jid].route.length)? this.jobs[jid].route[idx] : null; this._emit({czas:+this.time.toFixed(2), tryb:this.mode, zdarzenie:ev, zlecenie:jid, operacja:op, gniazdo:cell, szczegóły:details, WIP:this.WIP, conwip:`${this.cards_avail}/${this.cards_total}`, marszruta:route}); }
   tryReleaseFromBacklog(){ while(this.cards_avail>0 && this.backlog.length){ const jid=this.backlog.shift(); this.cards_avail--; this._log('CONWIP: WYDANIE KARTY',{jid,cell:'Start'}); const first=this.jobs[jid].route[0]; const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,0,first,this.jobs[jid].route,this.jobs[jid].times,'Start'])); this._log('RELEASE',{jid,cell:'Start',details:`start → ${first}`}); } }
   tryStart(cell,jid,idx,route,times){ if(this.cell_current[cell] || this.cell_busy_until[cell]>this.time){ this.cell_queues[cell].push([jid,idx,route,times,cell]); return false; } const start=this.time, finish=start+times[idx]; this.cell_busy_until[cell]=finish; this.cell_current[cell]=[jid,idx,route,times,start,finish]; this.events.push(new Event(finish,'finish_op',[cell])); this.WIP++; this._log('START',{jid,cell,idx,details:`czas=${times[idx].toFixed(1)} min`}); return true; }
-  canHeadStart(cell){ if(this.cell_current[cell]) return false; if(this.cell_busy_until[cell]>this.time) return false; const q=this.cell_queues[cell]; if(!q.length) return false; return true; }
   sweepStarts(){ let progressed=true; while(progressed){ progressed=false; for(const cell of Object.keys(this.cell_current)){ if(!this.cell_current[cell] && this.cell_busy_until[cell]<=this.time && this.cell_queues[cell].length){ const [jid,idx,route,times]=this.cell_queues[cell][0]; this.cell_queues[cell].shift(); if(this.tryStart(cell,jid,idx,route,times)) progressed=true; } } } }
   stepUntil(tLimit){ for(;;){ const ev=this.events.peek(); if(!ev || ev.time>tLimit){ this.time=tLimit; break; } this.events.pop(); this.time=ev.time; if(ev.type==='arrival'){ const [jid]=ev.payload; this.backlog.push(jid); this._log('ARRIVAL',{jid,cell:'Start',details:'backlog +1'}); this.tryReleaseFromBacklog(); } else if(ev.type==='finish_op'){ const [cell]=ev.payload; const cur=this.cell_current[cell]; if(!cur) continue; const [jid,idx,route,times,start,finish]=cur; this.cell_current[cell]=null; this.WIP--; this._log('FINISH',{jid,cell,idx,details:`koniec w ${cell}`}); if(idx<route.length-1){ const next_cell=route[idx+1]; const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,idx+1,next_cell,route,times,cell])); this._log('RUSZA NA KRAWĘDŹ',{jid,cell:next_cell,idx:idx+1,details:`transport → ${next_cell}`}); } else { const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,null,'Sink',route,times,cell])); this._log('RUSZA NA KRAWĘDŹ',{jid,cell:'Sink',idx:idx+1,details:'transport → Sink'}); } this.sweepStarts(); } else if(ev.type==='finish_move'){ const [jid,idx,next_cell,route,times,src]=ev.payload; if(next_cell==='Sink'){ this._log('PRZYBYŁ DO SINK',{jid,cell:'Sink',details:'zlecenie ukończone'}); this.cards_avail++; this._log('CONWIP: ZWROT KARTY',{jid,cell:'Sink'}); this.tryReleaseFromBacklog(); } else { this.cell_queues[next_cell].push([jid,idx,route,times,src]); this._log('PRZYBYŁ DO GNIAZDA',{jid,cell:next_cell,idx,details:`w kolejce ${next_cell}`}); this.sweepStarts(); } } } }
 }
 
 // ----- POLCA -----
 class PolcaSim{
-  constructor(n=N_JOBS){ this.mode='POLCA'; this.time=0; this.WIP=0; this.log=[]; this.jobs={}; this.cell_busy_until={}; this.cell_current={}; this.cell_queues={}; this.events=new MinHeap(); this.released=new Set(); this.q_source=new Map(); this.card_limit={}; this.cards_avail={}; this.backlog=[]; // oczekujące na kartę Start→X
-    // Zlecenia
-    for(let i=1;i<=n;i++){ const r=ROUTES_CORE[Math.floor(rand()*ROUTES_CORE.length)]; const times=r.map(c=>procTime(c)); const jid=`Z${String(i).padStart(2,'0')}`; this.jobs[jid]=new Job(jid, r.slice(), times);} const ops=CELLS.filter(c=>c!=='Start'&&c!=='Sink'); for(const c of ops){this.cell_busy_until[c]=0; this.cell_current[c]=null; this.cell_queues[c]=[]}
-    // Karty: pętle między kolejnymi gniazdami + Start→Pierwsze
-    const DEFAULT=2; // stały limit per para
+  constructor(n=N_JOBS){ this.mode='POLCA'; this.time=0; this.WIP=0; this.log=[]; this.jobs={}; this.cell_busy_until={}; this.cell_current={}; this.cell_queues={}; this.events=new MinHeap(); this.released=new Set(); this.q_source=new Map(); this.card_limit={}; this.cards_avail={}; this.backlog=[]; for(let i=1;i<=n;i++){ const r=randomRoute(); const times=r.map(c=>procTime(c)); const jid=`Z${String(i).padStart(2,'0')}`; this.jobs[jid]=new Job(jid, r.slice(), times);} for(const c of OPS){ this.cell_busy_until[c]=0; this.cell_current[c]=null; this.cell_queues[c]=[]; }
+    // Karty: Start→first i każda para kolejnych gniazd
+    const DEFAULT=2;
     const pairs=new Set();
-    for(const r of ROUTES_CORE){ // Start→first
-      pairs.add('Start→'+r[0]);
-      for(let i=0;i<r.length-1;i++) pairs.add(r[i]+'→'+r[i+1]);
-    }
+    for(const r of Object.values(this.jobs).map(j=>j.route)){ pairs.add('Start→'+r[0]); for(let i=0;i<r.length-1;i++) pairs.add(r[i]+'→'+r[i+1]); }
     for(const p of pairs){ this.card_limit[p]=DEFAULT; this.cards_avail[p]=DEFAULT; }
-    // Przyjazdy do backlogu
     let t=0; for(const jid of Object.keys(this.jobs)){ t+=randExp(ARRIVAL_MEAN); this.events.push(new Event(t,'arrival',[jid])); }
   }
   _emit(rec){ this.log.push(rec); }
   _log(ev,{jid=null,cell=null,idx=null,details=null,pair=null}={}){ const route = jid? this.jobs[jid].route.join(' → '): null; const op = (jid!=null && idx!=null && idx < this.jobs[jid].route.length)? this.jobs[jid].route[idx] : null; this._emit({czas:+this.time.toFixed(2), tryb:this.mode, zdarzenie:ev, zlecenie:jid, operacja:op, gniazdo:cell, szczegóły:details, pętla:pair?`${pair[0]}→${pair[1]}`:null, WIP:this.WIP, karty_stan:this.snapCards(), marszruta:route}); }
   snapCards(){ return Object.keys(this.cards_avail).sort().map(k=>{ const [a,b]=k.split('→'); return `${a.slice(0,3)}→${b.slice(0,3)}:${this.cards_avail[k]}/${this.card_limit[k]}`; }).join(' | '); }
-  tryReleaseFromBacklog(){ // próbuj wydać z backlogu gdy zwolniła się karta Start→X
-    let progressed=true; while(progressed){ progressed=false; for(let i=0;i<this.backlog.length;i++){ const jid=this.backlog[i]; const first=this.jobs[jid].route[0]; const key=`Start→${first}`; if(this.cards_avail[key]>0){ this.cards_avail[key]--; this.backlog.splice(i,1); this._log('POBRANIE KARTY',{jid,cell:'Start',pair:['Start',first],details:'wydanie z backlogu'}); const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,0,first,this.jobs[jid].route,this.jobs[jid].times,'Start'])); this._log('RELEASE',{jid,cell:'Start',details:`start → ${first}`}); progressed=true; break; } } }
-  }
+  tryReleaseFromBacklog(){ let progressed=true; while(progressed){ progressed=false; for(let i=0;i<this.backlog.length;i++){ const jid=this.backlog[i]; const first=this.jobs[jid].route[0]; const key=`Start→${first}`; if(this.cards_avail[key]>0){ this.cards_avail[key]--; this.backlog.splice(i,1); this._log('POBRANIE KARTY',{jid,cell:'Start',pair:['Start',first],details:'wydanie z backlogu'}); const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,0,first,this.jobs[jid].route,this.jobs[jid].times,'Start'])); this._log('RELEASE',{jid,cell:'Start',details:`start → ${first}`}); progressed=true; break; } } } }
   tryStart(cell,jid,idx,route,times,src){ if(this.cell_current[cell] || this.cell_busy_until[cell]>this.time){ this.cell_queues[cell].push([jid,idx,route,times,src]); return false; } const is_last=(idx===route.length-1); if(!is_last){ const key=`${route[idx]}→${route[idx+1]}`; if(this.cards_avail[key]<=0){ this.cell_queues[cell].push([jid,idx,route,times,src]); this._log('OCZEKIWANIE',{jid,cell,idx,details:`brak karty ${key}`,pair:[route[idx],route[idx+1]]}); return false; } this.cards_avail[key]--; this._log('POBRANIE KARTY',{jid,cell,idx,details:'autoryzacja downstream',pair:[route[idx],route[idx+1]]}); }
     const start=this.time, finish=start+times[idx]; this.cell_busy_until[cell]=finish; this.cell_current[cell]=[jid,idx,route,times,start,finish]; this.events.push(new Event(finish,'finish_op',[cell])); this.WIP++; this._log('START',{jid,cell,idx,details:`czas=${times[idx].toFixed(1)} min`}); return true; }
   canHeadStart(cell){ if(this.cell_current[cell]) return false; if(this.cell_busy_until[cell]>this.time) return false; const q=this.cell_queues[cell]; if(!q.length) return false; const [jid,idx,route]=q[0]; const is_last=(idx===route.length-1); if(is_last) return true; const key=`${route[idx]}→${route[idx+1]}`; return (this.cards_avail[key]||0)>0; }
   sweepStarts(){ let progressed=true; while(progressed){ progressed=false; for(const cell of Object.keys(this.cell_current)){ if(!this.cell_current[cell] && this.cell_busy_until[cell]<=this.time && this.cell_queues[cell].length){ const [jid,idx,route,times,src]=this.cell_queues[cell][0]; const is_last=(idx===route.length-1); const key=!is_last? `${route[idx]}→${route[idx+1]}`: null; if(is_last || (this.cards_avail[key]>0)){ this.cell_queues[cell].shift(); if(this.tryStart(cell,jid,idx,route,times,src)) progressed=true; } else { this._log('BLOKADA',{jid,cell,idx,details:`czoło kolejki: brak karty ${key}`,pair:[route[idx],route[idx+1]]}); } } } } }
-  stepUntil(tLimit){ for(;;){ const ev=this.events.peek(); if(!ev || ev.time>tLimit){ this.time=tLimit; break; } this.events.pop(); this.time=ev.time; if(ev.type==='arrival'){ const [jid]=ev.payload; this.backlog.push(jid); this._log('ARRIVAL',{jid,cell:'Start',details:'backlog +1'}); this.tryReleaseFromBacklog(); } else if(ev.type==='finish_op'){ const [cell]=ev.payload; const cur=this.cell_current[cell]; if(!cur) continue; const [jid,idx,route,times,start,finish]=cur; this.cell_current[cell]=null; // zwrot karty pary poprzedniej (w tym Start→first, gdy idx==0)
-        const prevPair = (idx===0)? ['Start', route[0]] : [route[idx-1], route[idx]]; const key=`${prevPair[0]}→${prevPair[1]}`; if(this.cards_avail[key]!=null){ this.cards_avail[key]++; this._log('ZWROT KARTY',{jid,cell,idx,details:`uwolniono ${key}`,pair:prevPair}); }
+  stepUntil(tLimit){ for(;;){ const ev=this.events.peek(); if(!ev || ev.time>tLimit){ this.time=tLimit; break; } this.events.pop(); this.time=ev.time; if(ev.type==='arrival'){ const [jid]=ev.payload; this.backlog.push(jid); this._log('ARRIVAL',{jid,cell:'Start',details:'backlog +1'}); this.tryReleaseFromBacklog(); } else if(ev.type==='finish_op'){ const [cell]=ev.payload; const cur=this.cell_current[cell]; if(!cur) continue; const [jid,idx,route,times,start,finish]=cur; this.cell_current[cell]=null; const prevPair = (idx===0)? ['Start', route[0]] : [route[idx-1], route[idx]]; const key=`${prevPair[0]}→${prevPair[1]}`; if(this.cards_avail[key]!=null){ this.cards_avail[key]++; this._log('ZWROT KARTY',{jid,cell,idx,details:`uwolniono ${key}`,pair:prevPair}); }
         this.WIP--; this._log('FINISH',{jid,cell,idx,details:`koniec w ${cell}`}); if(idx<route.length-1){ const next_cell=route[idx+1]; const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,idx+1,next_cell,route,times,cell])); this._log('RUSZA NA KRAWĘDŹ',{jid,cell:next_cell,idx:idx+1,details:`transport → ${next_cell}`}); } else { const end=this.time+MOVE_TIME; this.events.push(new Event(end,'finish_move',[jid,null,'Sink',route,times,cell])); this._log('RUSZA NA KRAWĘDŹ',{jid,cell:'Sink',idx:idx+1,details:'transport → Sink'}); } this.sweepStarts(); } else if(ev.type==='finish_move'){ const [jid,idx,next_cell,route,times,src]=ev.payload; if(next_cell==='Sink'){ this._log('PRZYBYŁ DO SINK',{jid,cell:'Sink',details:'zlecenie ukończone'}); } else { this.cell_queues[next_cell].push([jid,idx,route,times,src]); this._log('PRZYBYŁ DO GNIAZDA',{jid,cell:next_cell,idx,details:`w kolejce ${next_cell}`}); this.q_source.set(`${jid}@@${next_cell}`,[src,next_cell]); this.sweepStarts(); } } } }
 }
 
@@ -190,7 +204,7 @@ function boundaryPoint(ax,ay,bx,by,r=NODE_R-4){ const ang=Math.atan2(by-ay,bx-ax
 
 function drawWorld(sim){ ctx.clearRect(0,0,canvas.width,canvas.height); ctx.save(); ctx.translate(-viewOff[0], -viewOff[1]); ctx.scale(viewScale, viewScale);
   // Krawędzie
-  for(const p of EDGE_OPS){ const [a,b]=p.split('→'); const col=(a==='Start')? COLOR.start : colorForPair(a,b); ctx.strokeStyle=col; ctx.lineWidth=2; const [ax,ay]=NODE_POS[a], [bx,by]=NODE_POS[b]; const [x1,y1]=boundaryPoint(ax,ay,bx,by), [x2,y2]=boundaryPoint(bx,by,ax,ay); ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); const ang=Math.atan2(y2-y1,x2-x1); const p1=[x2-Math.cos(ang+0.6)*10, y2-Math.sin(ang+0.6)*10]; const p2=[x2-Math.cos(ang-0.6)*10, y2-Math.sin(ang-0.6)*10]; ctx.beginPath(); ctx.moveTo(x2,y2); ctx.lineTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.closePath(); ctx.fillStyle=col; ctx.fill(); }
+  for(const p of EDGE_OPS){ const [a,b]=p.split('→'); const col=colorForPair(a,b); ctx.strokeStyle=col; ctx.lineWidth=2; const [ax,ay]=NODE_POS[a], [bx,by]=NODE_POS[b]; const [x1,y1]=boundaryPoint(ax,ay,bx,by), [x2,y2]=boundaryPoint(bx,by,ax,ay); ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke(); const ang=Math.atan2(y2-y1,x2-x1); const p1=[x2-Math.cos(ang+0.6)*10, y2-Math.sin(ang+0.6)*10]; const p2=[x2-Math.cos(ang-0.6)*10, y2-Math.sin(ang-0.6)*10]; ctx.beginPath(); ctx.moveTo(x2,y2); ctx.lineTo(p1[0],p1[1]); ctx.lineTo(p2[0],p2[1]); ctx.closePath(); ctx.fillStyle=col; ctx.fill(); }
   // Węzły
   for(const [c, pos] of Object.entries(NODE_POS)){ const [x,y]=pos; ctx.fillStyle=(c!=='Start'&&c!=='Sink')? '#282A35' : '#22232C'; ctx.strokeStyle=COLOR.mid; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,NODE_R,0,Math.PI*2); ctx.fill(); ctx.stroke(); ctx.fillStyle=COLOR.ink; ctx.font='22px system-ui'; ctx.textAlign='center'; ctx.fillText(c, x, y-10); }
   // Liczniki kart – tylko POLCA
@@ -205,11 +219,11 @@ function drawWorld(sim){ ctx.clearRect(0,0,canvas.width,canvas.height); ctx.save
 
 // Kolejki – UI
 function slotSize(sim, cell){ const q=sim.cell_queues[cell]||[]; const cols=Math.max(QUEUE_COLLAPSED_SHOW, QUEUE_COLS_EXP); const w=Math.max(220, Math.min(360, SLOT_PADDING_X*2 + cols*(QUEUE_DOT_R*2+QUEUE_GAP))); const expanded=queueExpanded.has(cell); const h= expanded? (SLOT_PADDING_Y*2 + Math.ceil(q.length/QUEUE_COLS_EXP)*ROW_H) : QUEUE_BAR_H_BASE; return [w|0, h|0]; }
-function slotRects(sim){ const rects={}; for(const cell of Object.keys(sim.cell_queues)){ const [w,h]=slotSize(sim,cell); const mode=slotMode[cell]||'REL'; let x,y; if(mode==='REL'){ const rel=slotAnchorRel[cell]||[-(w>>1), NODE_R+14]; const [cx,cy]=NODE_POS[cell]; x=(cx+rel[0])|0; y=(cy+rel[1])|0; } else { const abs=slotPosAbs[cell]||[NODE_POS[cell][0]-(w>>1), NODE_POS[cell][1]+NODE_R+14]; x=abs[0]|0; y=abs[1]|0; } x=Math.max(0, Math.min(WORLD_W-w, x)); y=Math.max(48, Math.min(WORLD_H-FOOTER_H-20, y)); rects[cell]=[x,y,w,h]; } return rects; }
+function slotRects(sim){ const rects={}; for(const cell of OPS){ const [w,h]=slotSize(sim,cell); const mode=slotMode[cell]||'REL'; let x,y; if(mode==='REL'){ const rel=slotAnchorRel[cell]||[-(w>>1), NODE_R+14]; const [cx,cy]=NODE_POS[cell]; x=(cx+rel[0])|0; y=(cy+rel[1])|0; } else { const abs=slotPosAbs[cell]||[NODE_POS[cell][0]-(w>>1), NODE_POS[cell][1]+NODE_R+14]; x=abs[0]|0; y=abs[1]|0; } x=Math.max(0, Math.min(WORLD_W-w, x)); y=Math.max(48, Math.min(WORLD_H-FOOTER_H-20, y)); rects[cell]=[x,y,w,h]; } return rects; }
 function drawQueue(sim, cell, rect){ const q=sim.cell_queues[cell]||[]; const [bx,by,w,h]=rect; const hits=[]; queueHits.set(cell, hits); function addHit(x,y,jid){ hits.push({rect:[x-(QUEUE_DOT_R+4), y-(QUEUE_DOT_R+4), (QUEUE_DOT_R+4)*2, (QUEUE_DOT_R+4)*2], jid}); } function dot(x,y,color,{ring=false,selected=false}={}){ ctx.fillStyle=color; ctx.beginPath(); ctx.arc(x,y,QUEUE_DOT_R,0,Math.PI*2); ctx.fill(); if(selected){ ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,QUEUE_DOT_R+4,0,Math.PI*2); ctx.stroke(); } else if(ring){ ctx.strokeStyle=COLOR.green; ctx.lineWidth=2; ctx.beginPath(); ctx.arc(x,y,QUEUE_DOT_R+3,0,Math.PI*2); ctx.stroke(); } } ctx.fillStyle='#1E202C'; ctx.fillRect(bx,by,w,h); ctx.strokeStyle=COLOR.mid; ctx.strokeRect(bx,by,w,h); const [cx,cy]=NODE_POS[cell]; const tagY = (by>=cy)? (by-16) : (by+h+2); ctx.fillStyle=COLOR.ink; ctx.font='16px system-ui'; ctx.textAlign='left'; ctx.fillText(`${cell} [${slotMode[cell]||'REL'}]`, bx+6, tagY);
   if(queueExpanded.has(cell)){ const cols=QUEUE_COLS_EXP; let i=0; for(const [jid,idx,route,times,src] of q){ const row=Math.floor(i/cols), col=i%cols; const x=bx+SLOT_PADDING_X+col*(QUEUE_DOT_R*2+QUEUE_GAP)+QUEUE_DOT_R; const y=by+SLOT_PADDING_Y+row*ROW_H+QUEUE_DOT_R; i++; const prev=(idx>0)? route[idx-1] : src; const colc = (prev==='Start')? COLOR.start : colorForPair(prev, route[idx]); dot(x,y,colc,{ring:(i===1), selected:(jid===selectedJob)}); addHit(x,y,jid);} ctx.fillStyle=COLOR.ink; ctx.textAlign='left'; ctx.fillText(`Q=${q.length} (kliknij, by zwinąć)`, bx, by+h+14); } else { const show=Math.min(q.length, QUEUE_COLLAPSED_SHOW); let x=bx+w-SLOT_PADDING_X-QUEUE_DOT_R, y=by+(h>>1); for(let i=0;i<show;i++){ const [jid,idx,route,times,src]=q[i]; const prev=(idx>0)? route[idx-1] : src; const colc=(prev==='Start')? COLOR.start : colorForPair(prev, route[idx]); dot(x,y,colc,{ring:(i===0), selected:(jid===selectedJob)}); addHit(x,y,jid); x -= (QUEUE_DOT_R*2+QUEUE_GAP);} const rest=q.length-show; if(rest>0){ ctx.fillStyle=COLOR.ink; ctx.textAlign='left'; ctx.fillText(`+${rest}`, bx+SLOT_PADDING_X, by+(h>>1)+6);} if(q.length){ const [jid0,idx0,route0]=q[0]; const pr=(idx0>0)? route0[idx0-1] : 'Start'; const tagt=`${pr}→${route0[idx0]}`; const colc=(pr==='Start')? COLOR.start : colorForPair(pr,route0[idx0]); ctx.fillStyle=colc; ctx.textAlign='right'; ctx.fillText(tagt, bx+w-4, tagY);} ctx.fillStyle=COLOR.ink; ctx.textAlign='center'; ctx.fillText(`Q=${q.length}`, bx+(w>>1), by+h+14);} }
 
-// --------- Synchronizacja animacji z logiem ---------
+// --------- Sync animacji z logiem ---------
 function syncFromLog(sim, simTime){ for(const row of sim.log){ if(row.czas>simTime) break; const jid=row.zlecenie; const ev=row.zdarzenie; if(jid && !tokens.has(jid)) tokens.set(jid, new Token(jid, sim.jobs[jid]?.route||[])); if(ev==='RELEASE'){ const tok=tokens.get(jid); tok.setActive(true); tok.setInCell('Start',-1);} else if(ev==='RUSZA NA KRAWĘDŹ'){ const dest=row.gniazdo; const tok=tokens.get(jid); const a=(tok.state==='in_cell')? tok.cell : (tok.moveTo||'Start'); const st=row.czas, en=st+MOVE_TIME; tok.setMoving(a, dest, st, en, tok.idx+1);} else if(['PRZYBYŁ DO GNIAZDA','START','OCZEKIWANIE','BLOKADA'].includes(ev)){ const tok=tokens.get(jid); tok.setInCell(row.gniazdo, tok.idx>=0? tok.idx:0); if(ev==='PRZYBYŁ DO GNIAZDA'){ tok.lastPair=[(tok.idx>0? tok.route[tok.idx-1]:'Start'), tok.route[tok.idx]]; } } else if(ev==='PRZYBYŁ DO SINK'){ const tok=tokens.get(jid); tok.setInCell('Sink', tok.idx);} }
 }
 
@@ -231,10 +245,10 @@ function makeSim(){ tokens.clear(); simTime=0; if(MODE==='CONWIP'){ sim=new Conw
 
 function updateStateLine(){ const s=document.getElementById('stateLine'); const extra=(MODE==='CONWIP')? `  CONWIP=${sim.cards_avail}/${sim.cards_total}` : ``; s.textContent = `Tryb=${MODE}   Czas=${simTime.toFixed(1)} min   WIP=${sim.WIP}   Backlog=${(sim.backlog?sim.backlog.length:0)}${extra}   x${SIM_SPEED.toFixed(2)}   MOVE=${MOVE_TIME.toFixed(1)}m`; }
 
+function renderFooter(sim){ const cont=document.getElementById('footerContent'); const wipList = Object.entries(sim.cell_current).filter(([c,cur])=>!!cur).map(([cell,cur])=>{ const [jid,idx,route,times,start,finish]=cur; const frac=Math.max(0, Math.min(1, (sim.time-start)/(finish-start))); return {jid,cell,frac}; }).slice(0,8); let caption = (MODE==='CONWIP')? `CONWIP: ${sim.cards_avail}/${sim.cards_total}` : 'POLCA: karty na krawędziach'; let html = `<div class="title" style="margin:.25rem 0">WIP: ${wipList.length}  |  ${caption}</div>`; for(const {jid,cell,frac} of wipList){ html += `<div style=\"display:flex;align-items:center;gap:.5rem;margin:.2rem 0\"><div class=\"mono\" style=\"width:120px\">${jid}@${cell}</div><div class=\"bar\" style=\"width:220px\"><i style=\"width:${(frac*100).toFixed(0)}%\"></i></div><div class=\"mono\" style=\"width:36px;text-align:right\">${(frac*100).toFixed(0)}%</div></div>` } cont.innerHTML=html; }
+
 function loop(ts){ if(!lastRAF) lastRAF=ts; const dt=(ts-lastRAF)/1000; lastRAF=ts; if(!paused){ simTime += dt*SIM_SPEED*60.0; sim.stepUntil(simTime); } syncFromLog(sim, simTime); drawWorld(sim); renderFooter(sim); updateStateLine(); requestAnimationFrame(loop); }
 requestAnimationFrame(loop);
-
-function renderFooter(sim){ const cont=document.getElementById('footerContent'); const wipList = Object.entries(sim.cell_current).filter(([c,cur])=>!!cur).map(([cell,cur])=>{ const [jid,idx,route,times,start,finish]=cur; const frac=Math.max(0, Math.min(1, (sim.time-start)/(finish-start))); return {jid,cell,frac}; }).slice(0,8); let caption = (MODE==='CONWIP')? `CONWIP: ${sim.cards_avail}/${sim.cards_total}` : 'POLCA: karty na krawędziach'; let html = `<div class="title" style="margin:.25rem 0">WIP: ${wipList.length}  |  ${caption}</div>`; for(const {jid,cell,frac} of wipList){ html += `<div style="display:flex;align-items:center;gap:.5rem;margin:.2rem 0"><div class="mono" style="width:120px">${jid}@${cell}</div><div class="bar" style="width:220px"><i style="width:${(frac*100).toFixed(0)}%"></i></div><div class="mono" style="width:36px;text-align:right">${(frac*100).toFixed(0)}%</div></div>` } cont.innerHTML=html; }
 
 // Toolbar handlers
 btnPlay.onclick=()=>{ paused=!paused; btnPlay.textContent = paused? '▶︎ Start':'❚❚ Pauza'; };
@@ -244,11 +258,8 @@ rngMove.oninput=()=>{ MOVE_TIME=+rngMove.value; moveVal.textContent=`${MOVE_TIME
 rngConwip.oninput=()=>{ conwipVal.textContent=`${rngConwip.value} kart`; };
 btnSetMode.onclick=()=>{ MODE=modeSel.value; if(MODE==='CONWIP'){ CONWIP_LIMIT=+rngConwip.value|0; } makeSim(); };
 
-const btnQueues=document.getElementById('btnQueues');
 btnQueues.onclick=()=>{ SHOW_QUEUES=!SHOW_QUEUES; btnQueues.textContent = SHOW_QUEUES? 'Ukryj kolejki':'Pokaż kolejki'; btnQueues.setAttribute('aria-pressed', SHOW_QUEUES? 'true':'false'); };
-
 document.getElementById('btnFit').onclick=fitToWindow;
-
 document.getElementById('btnSaveLayout').onclick=()=>{ const data={mode:MODE,nodes:NODE_POS, slotMode, slotAnchorRel, slotPosAbs}; localStorage.setItem('hmlv_layout_'+MODE, JSON.stringify(data)); alert('Zapisano layout dla trybu '+MODE); };
 document.getElementById('btnLoadLayout').onclick=()=>{ const raw=localStorage.getItem('hmlv_layout_'+MODE); if(!raw){ alert('Brak zapisanego layoutu dla trybu '+MODE); return; } const d=JSON.parse(raw); if(d.nodes) NODE_POS=d.nodes; if(d.slotMode) slotMode=d.slotMode; if(d.slotAnchorRel) slotAnchorRel=d.slotAnchorRel; if(d.slotPosAbs) slotPosAbs=d.slotPosAbs; };
 
@@ -276,11 +287,12 @@ document.addEventListener('keydown', (e)=>{ if(e.key===' '){ paused=!paused; btn
 
 document.addEventListener('mousemove', (e)=>{ window._lastMouseX=e.clientX; window._lastMouseY=e.clientY; });
 
+// Job panel
 function renderJobPanel(sim, jid){ const el=document.getElementById('jobDetails'); if(!jid){ el.innerHTML='<span class="muted">—</span>'; return; } const job=sim.jobs[jid]; const tok=tokens.get(jid); let status='pre-entry'; if(tok.state==='moving') status = `w transporcie: ${tok.moveFrom} → ${tok.moveTo}`; else if(tok.state==='in_cell'){ let prog=null; for(const [cell,cur] of Object.entries(sim.cell_current)){ if(cur){ const [cj,idx,route,times,start,finish]=cur; if(cj===jid){ prog=Math.max(0,Math.min(1,(sim.time-start)/(finish-start))); break; } } } status = (prog!=null)? `w obróbce: ${tok.cell} (${(prog*100).toFixed(0)}%)` : `w kolejce: ${tok.cell}`; } const stageIdx=Math.max(tok.idx,0), total=job.route.length, done=(tok.state==='moving'||tok.state==='in_cell')? stageIdx:0; const routeTxt=job.route.join(' → '); const pct = total? Math.max(0,Math.min(1, done/total)) : 0; el.innerHTML = `<div class="mono" style="margin:.25rem 0 .5rem">Zadanie <b>${jid}</b></div><div class="route">${routeTxt}</div><div style="margin:.4rem 0 .2rem" class="muted">Etap: ${Math.min(stageIdx+1,total)}/${total}  |  Status: ${status}</div><div class="bar" style="width:100%"><i style="width:${(pct*100).toFixed(0)}%"></i></div>`; }
 
 // Start
-makeSim();
-updateModeInfo();
+function updateModeInfoAndMake(){ updateModeInfo(); makeSim(); }
+updateModeInfoAndMake();
 </script>
 </body>
 </html>
